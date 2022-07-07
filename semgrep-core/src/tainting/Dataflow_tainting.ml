@@ -191,6 +191,55 @@ let findings_of_tainted_return taints return_tok : T.finding list =
          | T.Arg i -> T.ArgToReturn (i, tokens, return_tok)
          | T.Src src -> T.SrcToReturn (src, tokens, return_tok))
 
+let labels_in_taint taints : string list =
+  taints |> Taints.elements
+  |> List.filter_map (fun (t : T.taint) ->
+         match t.orig with
+         | Src src ->
+             let _, ts = T.pm_of_trace src in
+             Some ts.Rule.label
+         | Arg _ -> None)
+
+(* FIXME: StrSet ? *)
+let rec eval_label_requires ~labels e =
+  match e.G.e with
+  | G.N (G.Id (id, _)) ->
+      let str, _ = id in
+      List.mem str labels
+  | G.Call ({ e = G.IdSpecial (G.Op G.Not, _); _ }, (_, [ Arg e1 ], _)) ->
+      not (eval_label_requires ~labels e1)
+  | G.Call ({ e = G.IdSpecial (G.Op op, _); _ }, (_, args, _)) -> (
+      match (op, eval_label_args ~labels args) with
+      | G.And, xs -> List.fold_left ( && ) true xs
+      | G.Or, xs -> List.fold_left ( || ) false xs
+      | _ ->
+          logger#error "Unexpected Boolean operator";
+          false)
+  | _else ->
+      logger#error "Unexpected `requires' expression";
+      false
+
+and eval_label_args ~labels args =
+  match args with
+  | [] -> []
+  | G.Arg e :: args' ->
+      eval_label_requires ~labels e :: eval_label_args ~labels args'
+  | _ :: args' ->
+      logger#error "Unexpected argument kind";
+      false :: eval_label_args ~labels args'
+
+let union_taints_filtering_labels ~new_ curr =
+  let labels = labels_in_taint curr in
+  Taints.fold
+    (fun new_taint taints ->
+      match new_taint.orig with
+      | Arg _ -> Taints.add new_taint taints
+      | Src src ->
+          let _, ts = T.pm_of_trace src in
+          let req = eval_label_requires ~labels ts.requires in
+          if req then Taints.add new_taint taints else taints)
+    new_ curr
+
 (*****************************************************************************)
 (* Tainted *)
 (*****************************************************************************)
@@ -328,9 +377,9 @@ let check_tainted_var env (var : IL.name) : Taints.t * var_env =
       in
       let taints_sources = Taints.union taints_sources_reg taints_sources_mut in
       let taints : Taints.t =
-        taints_sources
-        |> Taints.union taints_var_env
+        taints_var_env
         |> Taints.union taints_fun_env
+        |> union_taints_filtering_labels ~new_:taints_sources
       in
       let taints, var_env' =
         handle_taint_propagators
@@ -400,7 +449,9 @@ let rec check_tainted_expr env exp : Taints.t * var_env =
         |> T.taints_of_pms
       in
       let taints_exp, var_env = check_subexpr exp in
-      let taints = taints_sources |> Taints.union taints_exp in
+      let taints =
+        taints_exp |> union_taints_filtering_labels ~new_:taints_sources
+      in
       let taints, var_env =
         handle_taint_propagators { env with var_env } (`Exp exp) taints
       in
@@ -520,7 +571,9 @@ let check_tainted_instr env instr : Taints.t * var_env =
         |> T.taints_of_pms
       in
       let taints_instr, var_env' = check_instr instr.i in
-      let taints = taint_sources |> Taints.union taints_instr in
+      let taints =
+        taints_instr |> union_taints_filtering_labels ~new_:taint_sources
+      in
       let taints, var_env' =
         handle_taint_propagators
           { env with var_env = var_env' }
